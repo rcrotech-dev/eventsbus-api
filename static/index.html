@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Donate</title>
+  <style>
+    :root { --fg: #1d1d1f; --muted: #6b6b70; --bg: #f7f7f5; --card: #fff; --accent: #0b6e4f; --line: #e2e2de; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); background: var(--bg); padding: 2rem 1rem; }
+    main { max-width: 32rem; margin: 0 auto; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 2rem; }
+    h1 { margin: 0 0 .25rem; font-size: 1.6rem; }
+    p.lead { margin: 0 0 1.5rem; color: var(--muted); }
+    label { display: block; font-weight: 600; margin: 1rem 0 .35rem; font-size: .9rem; }
+    input, textarea { width: 100%; padding: .6rem .7rem; border: 1px solid var(--line); border-radius: 8px; font: inherit; }
+    .amounts { display: flex; gap: .5rem; flex-wrap: wrap; }
+    .amounts button { flex: 1; padding: .6rem; border: 1px solid var(--line); background: #fff; border-radius: 8px; font: inherit; cursor: pointer; }
+    .amounts button.active { border-color: var(--accent); background: var(--accent); color: #fff; }
+    #paypal-buttons { margin-top: 1.5rem; }
+    #status { margin-top: 1rem; min-height: 1.5rem; }
+    .error { color: #b00020; }
+    .success { color: var(--accent); font-weight: 600; }
+    .badge { display: inline-block; font-size: .75rem; padding: .1rem .5rem; border-radius: 99px; background: #fff3cd; color: #7a5b00; margin-left: .5rem; vertical-align: middle; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Support our work <span id="mode-badge" class="badge" hidden>SANDBOX</span></h1>
+  <p class="lead">Every donation helps. Thank you.</p>
+
+  <form id="donation-form" novalidate>
+    <label for="amount">Amount (<span id="currency">USD</span>)</label>
+    <div class="amounts" id="presets">
+      <button type="button" data-amount="10">10</button>
+      <button type="button" data-amount="25" class="active">25</button>
+      <button type="button" data-amount="50">50</button>
+      <button type="button" data-amount="100">100</button>
+    </div>
+    <input id="amount" name="amount" type="number" min="1" step="0.01" value="25" style="margin-top:.5rem" required>
+
+    <label for="donor_name">Name (optional)</label>
+    <input id="donor_name" name="donor_name" maxlength="200" autocomplete="name">
+
+    <label for="donor_email">Email (optional)</label>
+    <input id="donor_email" name="donor_email" type="email" maxlength="320" autocomplete="email">
+
+    <label for="message">Message (optional)</label>
+    <textarea id="message" name="message" rows="3" maxlength="1000"></textarea>
+  </form>
+
+  <div id="paypal-buttons"></div>
+  <div id="status" role="status"></div>
+</main>
+
+<script>
+  const statusEl = document.getElementById("status");
+  const amountEl = document.getElementById("amount");
+
+  function setStatus(text, cls) {
+    statusEl.textContent = text;
+    statusEl.className = cls || "";
+  }
+
+  document.getElementById("presets").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-amount]");
+    if (!btn) return;
+    document.querySelectorAll("#presets button").forEach((b) => b.classList.toggle("active", b === btn));
+    amountEl.value = btn.dataset.amount;
+  });
+
+  function formPayload() {
+    const val = (id) => document.getElementById(id).value.trim() || null;
+    return {
+      amount: Number(amountEl.value).toFixed(2),
+      donor_name: val("donor_name"),
+      donor_email: val("donor_email"),
+      message: val("message"),
+    };
+  }
+
+  async function postJson(url, body) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail = Array.isArray(data.detail) ? data.detail.map((d) => d.msg).join("; ") : data.detail;
+      throw new Error(detail || "Request failed");
+    }
+    return data;
+  }
+
+  function loadSdk(cfg) {
+    return new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "https://www.paypal.com/sdk/js?client-id=" + encodeURIComponent(cfg.paypal_client_id) +
+              "&currency=" + encodeURIComponent(cfg.currency) + "&intent=capture";
+      s.onload = resolve;
+      s.onerror = () => reject(new Error("Could not load PayPal"));
+      document.head.appendChild(s);
+    });
+  }
+
+  (async () => {
+    try {
+      const cfg = await fetch("/api/config").then((r) => r.json());
+      document.getElementById("currency").textContent = cfg.currency;
+      amountEl.min = cfg.donation_min;
+      amountEl.max = cfg.donation_max;
+      document.getElementById("mode-badge").hidden = cfg.paypal_mode !== "sandbox";
+      if (!cfg.paypal_client_id) throw new Error("PayPal is not configured (PAYPAL_CLIENT_ID missing).");
+      await loadSdk(cfg);
+
+      paypal.Buttons({
+        style: { layout: "vertical", shape: "rect", label: "donate" },
+        createOrder: async () => {
+          setStatus("");
+          const order = await postJson("/api/donations/orders", formPayload());
+          return order.order_id;
+        },
+        onApprove: async (data) => {
+          setStatus("Processing…");
+          const result = await postJson(`/api/donations/orders/${encodeURIComponent(data.orderID)}/capture`);
+          if (result.status === "COMPLETED") {
+            setStatus("Thank you! Your donation was received.", "success");
+            document.getElementById("donation-form").reset();
+          } else {
+            setStatus(`Donation status: ${result.status}. We'll confirm by email once it clears.`);
+          }
+        },
+        onCancel: () => setStatus("Donation cancelled."),
+        onError: (err) => setStatus(err.message || "Something went wrong.", "error"),
+      }).render("#paypal-buttons");
+    } catch (err) {
+      setStatus(err.message, "error");
+    }
+  })();
+</script>
+</body>
+</html>
